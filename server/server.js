@@ -1,10 +1,20 @@
 const express = require("express");
 const app = express();
 const http = require("http");
+const uuid = require("uuid");
 const server = http.createServer(app);
 
 const { Server } = require("socket.io");
 const io = new Server(server);
+
+
+let activePlayerCount = 0;
+class Player {
+  constructor(userName) {
+    this.id = uuid.v4();
+    this.userName = userName;
+  }
+}
 
 // Can use set | lookup
 const winningPatterns = [
@@ -19,31 +29,6 @@ const winningPatterns = [
   [3,5,7],
 ];
 
-function getMatchStatus(moves, lastMoveBy) {
-  const movesByPlayer = moves.filter((move, i) => {
-    if(lastMoveBy === "x") {
-      // numberOfMoves is 0 indexed
-      return i%2 === 0;
-    } else {
-      return i%2 !== 0;
-    }
-  });
-
-  if(movesByPlayer.length < 3) {
-    return false
-  }
-
-  wasWinningMove = winningPatterns.find((pattern) => {
-    const hasPattern =  pattern.every((position) =>
-      movesByPlayer.includes(position)
-    );
-    return hasPattern;
-  });
-
-  return wasWinningMove;
-}
-
-
 const matches = [];
 let matchCount = 0;
 class Match {
@@ -54,11 +39,14 @@ class Match {
     this.playerTwoId = playerTwoId;
     this.hasStarted = false;
     this.hasEnded = false;
-    // Later we can randomize the turn when
-    // the match starts
-    this.startingTurn = playerOneId;
+    this.startingTurn = null;
     this.moves = [];
     this.winner = null;
+  }
+
+  setStartingTurn() {
+    const turn = Math.floor(Math.random() * (1 - 0 + 1)) + 0;
+    this.startingTurn = turn === 0 ? this.playerOneId : this.playerTwoId;
   }
 
   sendMatchStatus() {
@@ -66,7 +54,6 @@ class Match {
   }
 
   endMatch() {
-    // TODO: emit and close
     if(this.winner) {
       console.log(`${this.winner} won match ${this.id}`);
     }
@@ -80,18 +67,38 @@ class Match {
     this.endMatch();
   }
 
-  updateMatchStatus() {
+  wasWinningMove() {
     const lastMoveBy = this.moves.length%2===0 ? "o" : "x";
-    const wasWinningMove = getMatchStatus(this.moves, lastMoveBy);
-    console.log("wasWinningMove: ", wasWinningMove);
-    if(wasWinningMove) {
+    const movesByPlayer = this.moves.filter((_, i) => {
+      if(lastMoveBy === "x") {
+        // numberOfMoves is 0 indexed
+        return i%2 === 0;
+      } else {
+        return i%2 !== 0;
+      }
+    });
+
+    if(movesByPlayer.length < 3) {
+      return false
+    }
+
+    return winningPatterns.find((pattern) => {
+      const hasPattern =  pattern.every((position) =>
+        movesByPlayer.includes(position)
+      );
+      return hasPattern;
+    });
+  }
+
+  updateMatchStatus() {
+    if(this.wasWinningMove()) {
       this.winner = this.moves.length % 2 === 0 ?
         (this.startingTurn !== this.playerOneId ? this.playerOneId : this.playerTwoId) 
         : this.startingTurn;
       this.endMatch();
     } else {
       if(this.moves.length === 9) {
-        console.log(`${this.id} ended in draw`);
+        console.log(`Match ${this.id} ended in draw`);
         this.endMatch();
       } else {
         this.sendMatchStatus();
@@ -103,16 +110,6 @@ class Match {
     // TODO: out of time, validateMove !important
     this.moves.push(move);
     this.updateMatchStatus();
-  }
-}
-
-let playerCount = 0;
-class Player {
-  constructor(userName) {
-    playerCount += 1;
-    // TODO: Use uuid
-    this.id = userName+playerCount;
-    this.userName = userName;
   }
 }
 
@@ -134,6 +131,7 @@ function findOrCreateMatch(playerId) {
   if(match) {
     match.playerTwoId = playerId;
     match.hasStarted = true;
+    match.setStartingTurn();
   } else {
     // create a new match
     match = new Match(playerId, null);
@@ -144,9 +142,14 @@ function findOrCreateMatch(playerId) {
 }
 
 io.on("connection", (socket) => {
-  console.log("A player connected !!");
+  activePlayerCount += 1;
+  console.log(`A player connected !! active players: ${activePlayerCount}`);
+
+  let player = null;
+  let playingMatch = null;
+
   socket.on("register", (userName) => {
-    const player = new Player(userName);
+    player = new Player(userName);
     socket.join(player.id);
     console.log(`Registered player ${userName} with id ${player.id}`);
     // We can utilize this to show user invites from other players, lobbies etc.
@@ -156,24 +159,45 @@ io.on("connection", (socket) => {
   // Now look for an existing match or create a new match
   socket.on("start", (playerId) => {
     const match = findOrCreateMatch(playerId);
+    playingMatch = match.id;
     socket.join(match.id);
     io.sockets.in(match.id).emit("match", match);
   });
 
   socket.on("disconnect", () => {
-    console.log(`Player disconnected`);
+    if(player) {
+      if(playingMatch) {
+        const registeredMatch = findMatchById(playingMatch);
+        if(!registeredMatch.hasEnded) {
+          registeredMatch.resign(player.id);
+          playingMatch = null;
+        }
+      }
+      console.log(`Player ${player.userName} disconnected`);
+    }
+    activePlayerCount -= 1;
+    console.log(`A player disconnected, active players: ${activePlayerCount}`);
   });
 
   socket.on("move", (moveData) => {
     const {match, move} = moveData;
     const registeredMatch = findMatchById(match.id);
-    registeredMatch.addMove(move);
+    if (!registeredMatch.hasEnded) {
+      registeredMatch.addMove(move);
+    } else {
+      // TODO: emit to client, Match has already ended
+    }
   });
 
   socket.on("resign", (exitData) => {
     const {player, match} = exitData;
     const registeredMatch = findMatchById(match.id);
-    registeredMatch.resign(player.id);
+    if(!registeredMatch.hasEnded) {
+      registeredMatch.resign(player.id);
+      playingMatch = null;
+    } else {
+      // TODO: emit to client, Match has already ended
+    }
     console.log(`Player ${player.id} has quit!`);
   })
 });

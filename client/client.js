@@ -63,7 +63,7 @@ function getBoard(match) {
 
 function displayBoard(board) {
   for(let i=0; i<9; i+=3) {
-    console.log(board.slice(i, i+3));
+    console.log(...board.slice(i, i+3));
   }
 }
 
